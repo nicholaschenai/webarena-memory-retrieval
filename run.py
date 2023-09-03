@@ -1,4 +1,5 @@
 """Script to run end-to-end evaluation on the benchmark"""
+from __future__ import annotations
 import argparse
 import glob
 import json
@@ -32,6 +33,11 @@ from browser_env.helper_functions import (
     get_action_description,
 )
 from evaluation_harness import evaluator_router
+
+# my modifications
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.vectorstores import Chroma
+import pandas as pd
 
 LOG_FOLDER = "log_files"
 Path(LOG_FOLDER).mkdir(parents=True, exist_ok=True)
@@ -84,7 +90,7 @@ def config() -> argparse.Namespace:
     parser.add_argument("--viewport_width", type=int, default=1280)
     parser.add_argument("--viewport_height", type=int, default=720)
     parser.add_argument("--save_trace_enabled", action="store_true")
-    parser.add_argument("--sleep_after_execution", type=float, default=0.0)
+    parser.add_argument("--sleep_after_execution", type=float, default=2.5)
 
     parser.add_argument("--max_steps", type=int, default=30)
 
@@ -127,6 +133,9 @@ def config() -> argparse.Namespace:
     # example config
     parser.add_argument("--test_start_idx", type=int, default=0)
     parser.add_argument("--test_end_idx", type=int, default=1000)
+
+
+    parser.add_argument("--retrieval_top_k", type=int, default=None)
 
     # logging related
     parser.add_argument("--result_dir", type=str, default="")
@@ -210,6 +219,22 @@ def test(
     scores = []
     max_steps = args.max_steps
 
+    # my mods
+    RESULT_FILE_PATH = f"{args.result_dir}/logged_results.csv"
+    if os.path.exists(RESULT_FILE_PATH):
+        print('results file exists, resuming from there')
+        df = pd.read_csv(RESULT_FILE_PATH, index_col=0)
+    else:
+        print('create new results file')
+        df = pd.DataFrame(index=range(812), columns=['score'])
+
+    if args.retrieval_top_k:
+        vectordb = Chroma(
+                collection_name="tasks",
+                embedding_function=OpenAIEmbeddings(),
+                persist_directory=f"{args.result_dir}/vectordb"
+        )
+
     early_stop_thresholds = {
         "parsing_failure": args.parsing_failure_th,
         "repeating_action": args.repeating_action_failure_th,
@@ -250,6 +275,20 @@ def test(
             trajectory.append(state_info)
 
             meta_data = {"action_history": ["None"]}
+
+            # vectordb
+            related_intents = []
+            if args.retrieval_top_k:
+                k = min(vectordb._collection.count(), args.retrieval_top_k)
+                if k:
+                    docs = vectordb.similarity_search(intent, k=k)
+                    print('related intents: \n')
+                    for doc in docs:
+                        print(doc.page_content + '\n')
+                        related_intents.append((doc.page_content, doc.metadata["score"], doc.metadata["historical_actions_str"]))
+                # pass related_intents to agent
+                meta_data["related_intents"] = related_intents
+
             while True:
                 early_stop_flag, stop_info = early_stop(
                     trajectory, max_steps, early_stop_thresholds
@@ -303,6 +342,15 @@ def test(
 
             scores.append(score)
 
+            df.score[task_id] = score
+            df.to_csv(RESULT_FILE_PATH)
+
+            # pass historical_actions_str here
+
+            if args.retrieval_top_k:
+                historical_actions_str = agent.prompt_constructor.construct_history(trajectory, meta_data)
+                vectordb.add_texts(texts=[intent], metadatas=[{"score": score, "task_id": task_id, "historical_actions_str": historical_actions_str}])
+
             if score == 1:
                 logger.info(f"[Result] (PASS) {config_file}")
             else:
@@ -329,6 +377,11 @@ def test(
 
     env.close()
     logger.info(f"Average score: {sum(scores) / len(scores)}")
+    print(f'df stats: len: {len(df.index)} avg: {df.score.mean()} number of nan: {df.score.isnull().sum()}')
+    has_gitlab_df = pd.read_csv('has_gitlab.csv', index_col=0)
+    df = df[~has_gitlab_df.has_gitlab]
+    print('after filtering')
+    print(f'df stats: len: {len(df.index)} avg: {df.score.mean()} number of nan: {df.score.isnull().sum()}')
 
 
 def prepare(args: argparse.Namespace) -> None:
@@ -380,7 +433,7 @@ def dump_config(args: argparse.Namespace) -> None:
 
 if __name__ == "__main__":
     args = config()
-    args.sleep_after_execution = 2.5
+    # args.sleep_after_execution = 2.5
     prepare(args)
 
     test_file_list = []
@@ -390,7 +443,7 @@ if __name__ == "__main__":
         test_file_list.append(f"config_files/{i}.json")
     test_file_list = get_unfinished(test_file_list, args.result_dir)
     print(f"Total {len(test_file_list)} tasks left")
-    args.render = True
+    # args.render = True
     args.render_screenshot = True
     args.save_trace_enabled = True
 
